@@ -1,0 +1,235 @@
+#include "vex.h"
+
+using namespace vex;
+
+// VEX Competition Template
+competition Competition;
+
+brain Brain;
+controller Controller1(primary);
+
+motor LeftFront(PORT1, false);
+motor LeftRear(PORT11, false);
+motor RightFront(PORT12, true);
+motor RightRear(PORT10, true);
+motor LiftLeft(PORT13, true);
+motor LiftRight(PORT9, false);
+motor Claw(PORT2, false);
+// NEW: Added the 5.5W Toggle Motor on Port 3
+motor ToggleMotor(PORT3, false); 
+
+// Limits and constants
+constexpr double LIFT_CALIBRATION_MAX_DEG = 3335;
+constexpr double LIFT_SLOW_ZONE_DEG = 100;
+constexpr double CLAW_CALIBRATION_MAX_DEG = 211;
+constexpr double LIMIT_MARGIN_DEG = 5;
+constexpr int DRIVE_MAX_PCT = 50;
+constexpr int TURN_MAX_PCT = 30;
+constexpr int PRECISION_DRIVE_PCT = 20;
+constexpr int PRECISION_TURN_PCT = 12;
+constexpr int DRIVE_RAMP_STEP_PCT = 2;
+constexpr int LIFT_PCT = 30;
+constexpr int LIFT_NEAR_LIMIT_PCT = 10;
+constexpr int CLAW_PCT = 20;
+constexpr int JOYSTICK_DEADZONE = 8;
+
+int axisInput(int value) {
+  if (value >= -JOYSTICK_DEADZONE && value <= JOYSTICK_DEADZONE) return 0;
+  return value;
+}
+
+int shapedAxis(int value) {
+  value = axisInput(value);
+  if (value == 0) return 0;
+  const int magnitude = value < 0 ? -value : value;
+  const int scaled = (magnitude - JOYSTICK_DEADZONE) * 100 / (100 - JOYSTICK_DEADZONE);
+  const int curved = scaled * scaled / 100;
+  const int blended = (7 * scaled + 3 * curved + 5) / 10;
+  return value < 0 ? -blended : blended;
+}
+
+int shapedSteering(int value) {
+  value = axisInput(value);
+  if (value == 0) return 0;
+  const int magnitude = value < 0 ? -value : value;
+  const int scaled = (magnitude - JOYSTICK_DEADZONE) * 100 / (100 - JOYSTICK_DEADZONE);
+  const int curved = scaled * scaled / 100;
+  const int blended = (4 * scaled + 6 * curved + 5) / 10;
+  return value < 0 ? -blended : blended;
+}
+
+int rampToward(int current, int target) {
+  if (target > current + DRIVE_RAMP_STEP_PCT) return current + DRIVE_RAMP_STEP_PCT;
+  if (target < current - DRIVE_RAMP_STEP_PCT) return current - DRIVE_RAMP_STEP_PCT;
+  return target;
+}
+
+void runMotor(motor& m, int speed, brakeType stopped) {
+  if (speed > 0) m.spin(forward, speed, percent);
+  else if (speed < 0) m.spin(reverse, -speed, percent);
+  else m.stop(stopped);
+}
+
+void stopDrive() {
+  LeftFront.stop(brake);
+  LeftRear.stop(brake);
+  RightFront.stop(brake);
+  RightRear.stop(brake);
+}
+
+void stopAll() {
+  stopDrive();
+  LiftLeft.stop(brake); LiftRight.stop(brake);
+  Claw.stop(brake);
+  ToggleMotor.stop(brake); // Make sure toggle motor stops too
+}
+
+// ---------------------------------------------------------
+// PRE-AUTONOMOUS
+// ---------------------------------------------------------
+void pre_auton(void) {
+  LiftLeft.setMaxTorque(50, percent);
+  LiftRight.setMaxTorque(50, percent);
+  Claw.setMaxTorque(90, percent);
+  ToggleMotor.setMaxTorque(100, percent); // Max torque for the 5.5W motor
+  
+  LiftLeft.setPosition(0, degrees);
+  LiftRight.setPosition(0, degrees);
+  Claw.setPosition(0, degrees);
+  ToggleMotor.setPosition(0, degrees); // Zero the toggle motor
+  
+  stopAll();
+}
+
+// ---------------------------------------------------------
+// AUTONOMOUS
+// ---------------------------------------------------------
+void autonomous(void) {
+  // Empty - robot will sit still
+}
+
+// ---------------------------------------------------------
+// DRIVER CONTROL
+// ---------------------------------------------------------
+void usercontrol(void) {
+  int filteredThrottle = 0;
+  int filteredSteering = 0;
+  int screenTicks = 0;
+  
+  // NEW: Variables to track the toggle state
+  bool toggleState = false;
+  bool aWasDown = false;
+
+  while (1) {
+    // Driving
+    const int throttle = -shapedAxis(Controller1.Axis3.position());
+    const int steering = -shapedSteering(Controller1.Axis1.position());
+    const bool precision = Controller1.ButtonB.pressing();
+    const int driveLimit = precision ? PRECISION_DRIVE_PCT : DRIVE_MAX_PCT;
+    const int turnLimit = precision ? PRECISION_TURN_PCT : TURN_MAX_PCT;
+    
+    const int targetThrottle = throttle * driveLimit / 100;
+    const int targetSteering = steering * turnLimit / 100;
+
+    filteredThrottle = throttle == 0 ? 0 : rampToward(filteredThrottle, targetThrottle);
+    filteredSteering = steering == 0 ? 0 : rampToward(filteredSteering, targetSteering);
+    
+    if (precision) {
+      if (filteredThrottle > driveLimit) filteredThrottle = driveLimit;
+      if (filteredThrottle < -driveLimit) filteredThrottle = -driveLimit;
+      if (filteredSteering > turnLimit) filteredSteering = turnLimit;
+      if (filteredSteering < -turnLimit) filteredSteering = -turnLimit;
+    }
+    
+    int leftMix = filteredThrottle + filteredSteering;
+    int rightMix = filteredThrottle - filteredSteering;
+    const int leftMagnitude = leftMix < 0 ? -leftMix : leftMix;
+    const int rightMagnitude = rightMix < 0 ? -rightMix : rightMix;
+    const int peak = leftMagnitude > rightMagnitude ? leftMagnitude : rightMagnitude;
+    
+    if (peak > driveLimit) {
+      leftMix = leftMix * driveLimit / peak;
+      rightMix = rightMix * driveLimit / peak;
+    }
+    
+    runMotor(LeftFront, leftMix, brake);
+    runMotor(LeftRear, leftMix, brake);
+    runMotor(RightFront, rightMix, brake);
+    runMotor(RightRear, rightMix, brake);
+
+    // Lift Control
+    const double liftRightPosition = LiftRight.position(degrees);
+    const bool l1 = Controller1.ButtonL1.pressing();
+    const bool l2 = Controller1.ButtonL2.pressing();
+    int liftSpeed = 0;
+    const double liftHeight = -liftRightPosition;
+    const double upperLimit = LIFT_CALIBRATION_MAX_DEG - LIMIT_MARGIN_DEG;
+    
+    if (l1 && !l2 && liftHeight < upperLimit) {
+      liftSpeed = (upperLimit - liftHeight <= LIFT_SLOW_ZONE_DEG) ? -LIFT_NEAR_LIMIT_PCT : -LIFT_PCT;
+    }
+    if (l2 && !l1 && liftHeight > LIMIT_MARGIN_DEG) {
+      liftSpeed = (liftHeight <= LIFT_SLOW_ZONE_DEG) ? LIFT_NEAR_LIMIT_PCT : LIFT_PCT;
+    }
+    runMotor(LiftLeft, liftSpeed, brake);
+    runMotor(LiftRight, liftSpeed, brake);
+
+    // Claw Control
+    const double clawPosition = Claw.position(degrees);
+    int clawSpeed = 0;
+    const bool r1 = Controller1.ButtonR1.pressing();
+    const bool r2 = Controller1.ButtonR2.pressing();
+    const double clawClosedDegrees = -clawPosition;
+    
+    if (r1 && !r2 && clawClosedDegrees < CLAW_CALIBRATION_MAX_DEG - LIMIT_MARGIN_DEG) {
+      clawSpeed = -CLAW_PCT;
+    }
+    if (r2 && !r1 && clawClosedDegrees > LIMIT_MARGIN_DEG) {
+      clawSpeed = CLAW_PCT;
+    }
+    runMotor(Claw, clawSpeed, brake);
+
+    // ---------------------------------------------------------
+    // NEW: Toggle Motor Control (Button A)
+    // ---------------------------------------------------------
+    bool aDown = Controller1.ButtonA.pressing();
+    
+    // Only flip the switch if A is pressed AND it wasn't pressed in the previous loop
+    if (aDown && !aWasDown) {
+      toggleState = !toggleState; // Flips from false to true, or true to false
+    }
+    aWasDown = aDown; // Remember the button's state for the next loop
+
+    // Move the motor based on the toggle state
+    if (toggleState) {
+      // Moves to 90 degrees when toggled ON (adjust 90 if it needs to move further)
+      ToggleMotor.spinToPosition(90, degrees, 50, velocityUnits::pct, false); 
+    } else {
+      // Returns to 0 degrees when toggled OFF
+      ToggleMotor.spinToPosition(0, degrees, 50, velocityUnits::pct, false);
+    }
+    // ---------------------------------------------------------
+
+    // Basic Screen Telemetry
+    if (++screenTicks >= 10) {
+      Brain.Screen.printAt(10, 205, "Lift:%6.0f  Claw:%6.1f deg   ", -liftRightPosition, -clawPosition);
+      screenTicks = 0;
+    }
+
+    wait(20, msec); 
+  }
+}
+
+// ---------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------
+int main() {
+  Competition.autonomous(autonomous);
+  Competition.drivercontrol(usercontrol);
+
+  pre_auton();
+
+  while (true) {
+    wait(100, msec);
+  }
+}
