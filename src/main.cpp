@@ -1,10 +1,12 @@
 #include "vex.h"
+#include <atomic>
 
 using namespace vex;
 
-// VEXcode V5 C++: create a blank project and replace its main.cpp with this file.
+// Competition program for the Spartanian V5 robot.
 // Leave controller actions unassigned in the Devices menu: this program reads
 // the joysticks and buttons itself.
+competition Competition;
 brain Brain;
 controller Controller1(primary);
 
@@ -16,6 +18,10 @@ motor RightRear(PORT10, true);
 motor LiftLeft(PORT13, true);
 motor LiftRight(PORT9, false);
 motor Claw(PORT2, false);
+motor WallLifter(PORT3, false);
+
+std::atomic<bool> Armed(false);
+std::atomic<bool> LiftBelowZeroFault(false);
 
 // Place the lift at its LOWER reference before the first A after startup.
 // This temporary upper limit is a calibration step, not the real top stop.
@@ -24,20 +30,36 @@ constexpr double LIFT_SLOW_ZONE_DEG = 100;
 // Place the claw OPEN before A. Closing travel is still a test bound, not the
 // measured closed endpoint.
 constexpr double CLAW_CALIBRATION_MAX_DEG = 211;
+// Place the wall-button lifter at its physical DOWN position before first A.
+constexpr double WALL_LIFTER_MAX_DEG = 130;
+constexpr double WALL_LIFTER_SLOW_ZONE_DEG = 30;
 constexpr double LIMIT_MARGIN_DEG = 5;
 constexpr int DRIVE_MAX_PCT = 50;
 constexpr int TURN_MAX_PCT = 30;
-constexpr int PRECISION_DRIVE_PCT = 20;
-constexpr int PRECISION_TURN_PCT = 12;
+constexpr int PRECISION_DRIVE_PCT = 15;
+constexpr int PRECISION_TURN_PCT = 8;
 constexpr int DRIVE_RAMP_STEP_PCT = 2;  // Per 20 ms loop, about 0.5 s to full speed.
 constexpr int LIFT_PCT = 30;
 constexpr int LIFT_NEAR_LIMIT_PCT = 10;
 constexpr int CLAW_PCT = 20;
+constexpr int WALL_LIFTER_PCT = 25;
+constexpr int WALL_LIFTER_NEAR_LIMIT_PCT = 8;
 constexpr int JOYSTICK_DEADZONE = 8;
 
 int axisInput(int value) {
   if (value >= -JOYSTICK_DEADZONE && value <= JOYSTICK_DEADZONE) return 0;
   return value;
+}
+
+// In precision mode, use the whole stick range after the deadzone so small
+// commands respond more evenly at the lower maximum speed.
+int linearAxis(int value) {
+  value = axisInput(value);
+  if (value == 0) return 0;
+  const int magnitude = value < 0 ? -value : value;
+  const int scaled = (magnitude - JOYSTICK_DEADZONE) * 100 /
+                     (100 - JOYSTICK_DEADZONE);
+  return value < 0 ? -scaled : scaled;
 }
 
 // Give small stick movements fine control and reserve full speed for the edge.
@@ -83,6 +105,7 @@ void stopAll() {
   RightFront.stop(brake); RightRear.stop(brake);
   LiftLeft.stop(brake); LiftRight.stop(brake);
   Claw.stop(brake);
+  WallLifter.stop(brake);
 }
 
 int missingMotorPort() {
@@ -107,87 +130,63 @@ void showStatus(int state, int missingPort) {
   Brain.Screen.clearScreen();
   Brain.Screen.setPenColor(white);
   Brain.Screen.printAt(10, 45, "SPARTANIAN - slot 8");
-  if (state == 1) Brain.Screen.printAt(10, 85, "READY: lift + claw direction test");
-  else if (state == 2) Brain.Screen.printAt(10, 85, "Lift low, claw open: press A");
+  if (state == 1) Brain.Screen.printAt(10, 85, "READY: driver control");
+  else if (state == 2) Brain.Screen.printAt(10, 85, "Lift low, claw open, wall low: A");
   else if (state == 3) Brain.Screen.printAt(10, 85, "Controller disconnected");
   else if (state == 4) Brain.Screen.printAt(10, 85, "Motor missing on port %d", missingPort);
   else if (state == 7) Brain.Screen.printAt(10, 85, "Lift below zero; check, restart");
-  Brain.Screen.printAt(10, 125, "Right drive  Left turn  Hold B: slow");
-  Brain.Screen.printAt(10, 165, "L1 up L2 down R1 close R2 open");
-  Brain.Screen.printAt(10, 240, "Lift 0..3330  Claw 0..206 deg");
+  Brain.Screen.printAt(10, 125, "Left drive  Right turn  Hold B: slow");
+  Brain.Screen.printAt(10, 165, "L1/L2 lift R1/R2 claw Up/Down wall");
+  Brain.Screen.printAt(10, 240, "Lift 0..3330 Claw 0..206 Wall 0..130");
 }
 
 bool controlsReleased() {
-  return axisInput(Controller1.Axis4.position()) == 0 &&
-         axisInput(Controller1.Axis2.position()) == 0 &&
+  return axisInput(Controller1.Axis1.position()) == 0 &&
+         axisInput(Controller1.Axis3.position()) == 0 &&
          !Controller1.ButtonL1.pressing() && !Controller1.ButtonL2.pressing() &&
-         !Controller1.ButtonR1.pressing() && !Controller1.ButtonR2.pressing();
+         !Controller1.ButtonR1.pressing() && !Controller1.ButtonR2.pressing() &&
+         !Controller1.ButtonUp.pressing() && !Controller1.ButtonDown.pressing();
 }
 
-int main() {
-  // Place the lift at its LOWER reference and claw OPEN before
-  // the first press of A. No sensors verify either physical position.
-
+void pre_auton() {
+  // Encoder references are set by A after the mechanisms have been placed at
+  // their physical starting positions, including before field driver control.
   LiftLeft.setMaxTorque(50, percent);
   LiftRight.setMaxTorque(50, percent);
   Claw.setMaxTorque(90, percent);
+  WallLifter.setMaxTorque(100, percent);
   stopAll();
+}
 
-  bool armed = false;
-  bool referenceSet = false;
-  bool aWasDown = false;
-  bool xWasDown = false;
+void autonomous() {
+  stopAll();
+}
+
+void usercontrol() {
   int filteredThrottle = 0;
   int filteredSteering = 0;
-  bool liftBelowZeroFault = false;
   int screenTicks = 0;
   while (true) {
-    const bool connected = Controller1.installed();
-    const int missingPort = missingMotorPort();
-    const bool motorsPresent = missingPort == 0;
-    const bool aDown = connected && Controller1.ButtonA.pressing();
-    const bool xDown = connected && Controller1.ButtonX.pressing();
-
-    if (!connected || !motorsPresent || (xDown && !xWasDown)) armed = false;
-    if (!armed && !liftBelowZeroFault &&
-        connected && motorsPresent && aDown && !aWasDown &&
-        controlsReleased() && !xDown) {
-      if (!referenceSet) {
-        LiftLeft.setPosition(0, degrees);
-        LiftRight.setPosition(0, degrees);
-        Claw.setPosition(0, degrees);
-        referenceSet = true;
-      }
-      armed = true;
-    }
-    aWasDown = aDown;
-    xWasDown = xDown;
-
-    if (!armed) {
+    if (!Armed.load()) {
       filteredThrottle = 0;
       filteredSteering = 0;
       stopAll();
-      if (!connected) showStatus(3, 0);
-      else if (!motorsPresent) showStatus(4, missingPort);
-      else if (liftBelowZeroFault) showStatus(7, 0);
-      else showStatus(2, 0);
       wait(20, msec);
       continue;
     }
 
-    showStatus(1, 0);
-
-    // Both axes are inverted to match this robot's observed wheel direction.
-    // Right stick vertical = throttle; left stick horizontal = steering.
-    const int throttle = -shapedAxis(Controller1.Axis2.position());
-    const int steering = -shapedSteering(Controller1.Axis4.position());
+    // Teammate's stick mapping: left vertical drives; right horizontal turns.
     const bool precision = Controller1.ButtonB.pressing();
+    const int throttle = -(precision ? linearAxis(Controller1.Axis3.position())
+                                     : shapedAxis(Controller1.Axis3.position()));
+    const int steering = -(precision ? linearAxis(Controller1.Axis1.position())
+                                     : shapedSteering(Controller1.Axis1.position()));
     const int driveLimit = precision ? PRECISION_DRIVE_PCT : DRIVE_MAX_PCT;
     const int turnLimit = precision ? PRECISION_TURN_PCT : TURN_MAX_PCT;
     const int targetThrottle = throttle * driveLimit / 100;
     const int targetSteering = steering * turnLimit / 100;
     // Centering either stick removes that component immediately. In particular,
-    // releasing the left stick stops turning even while driving forward.
+    // releasing the right stick stops turning even while driving forward.
     filteredThrottle = throttle == 0 ? 0 :
                        rampToward(filteredThrottle, targetThrottle);
     filteredSteering = steering == 0 ? 0 :
@@ -214,17 +213,17 @@ int main() {
 
     const double liftRightPosition = LiftRight.position(degrees);
     const double clawPosition = Claw.position(degrees);
+    const double wallPosition = WallLifter.position(degrees);
     if (++screenTicks >= 10) {
-      Brain.Screen.printAt(10, 205, "Lift:%6.0f  Claw close:%6.1f deg   ",
-                           -liftRightPosition, -clawPosition);
+      Brain.Screen.printAt(10, 205, "Lift:%5.0f Claw:%5.0f Wall:%5.0f deg  ",
+                           -liftRightPosition, -clawPosition, wallPosition);
       screenTicks = 0;
     }
 
     if (liftRightPosition > LIMIT_MARGIN_DEG) {
-      liftBelowZeroFault = true;
-      armed = false;
+      LiftBelowZeroFault.store(true);
+      Armed.store(false);
       stopAll();
-      showStatus(7, 0);
       wait(20, msec);
       continue;
     }
@@ -251,6 +250,53 @@ int main() {
     if (r2 && !r1 && clawClosedDegrees > LIMIT_MARGIN_DEG)
       clawSpeed = CLAW_PCT;
     runMotor(Claw, clawSpeed, brake);
+
+    // Manual wall-button lifter, bounded by its motor encoder reference.
+    const bool wallUp = Controller1.ButtonUp.pressing();
+    const bool wallDown = Controller1.ButtonDown.pressing();
+    int wallSpeed = 0;
+    if (wallUp && !wallDown && wallPosition < WALL_LIFTER_MAX_DEG)
+      wallSpeed = WALL_LIFTER_MAX_DEG - wallPosition <= WALL_LIFTER_SLOW_ZONE_DEG
+                      ? WALL_LIFTER_NEAR_LIMIT_PCT : WALL_LIFTER_PCT;
+    if (wallDown && !wallUp && wallPosition > 0)
+      wallSpeed = wallPosition <= WALL_LIFTER_SLOW_ZONE_DEG
+                      ? -WALL_LIFTER_NEAR_LIMIT_PCT : -WALL_LIFTER_PCT;
+    runMotor(WallLifter, wallSpeed, brake);
+    wait(20, msec);
+  }
+}
+
+int main() {
+  Competition.autonomous(autonomous);
+  Competition.drivercontrol(usercontrol);
+  pre_auton();
+  bool referenceSet = false;
+  bool aWasDown = false;
+  while (true) {
+    const bool connected = Controller1.installed();
+    const int missingPort = missingMotorPort();
+    const bool aDown = connected && Controller1.ButtonA.pressing();
+    const bool xDown = connected && Controller1.ButtonX.pressing();
+
+    if (!connected || missingPort != 0 || xDown) Armed.store(false);
+    if (!Armed.load() && !LiftBelowZeroFault.load() && connected &&
+        missingPort == 0 && aDown && !aWasDown && !xDown &&
+        controlsReleased()) {
+      if (!referenceSet) {
+        LiftLeft.setPosition(0, degrees);
+        LiftRight.setPosition(0, degrees);
+        Claw.setPosition(0, degrees);
+        WallLifter.setPosition(0, degrees);
+        referenceSet = true;
+      }
+      Armed.store(true);
+    }
+    aWasDown = aDown;
+
+    if (!connected) showStatus(3, 0);
+    else if (missingPort != 0) showStatus(4, missingPort);
+    else if (LiftBelowZeroFault.load()) showStatus(7, 0);
+    else showStatus(Armed.load() ? 1 : 2, 0);
     wait(20, msec);
   }
 }
